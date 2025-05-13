@@ -1,0 +1,170 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+#include <SPI.h>
+#include <SD.h>
+
+#include <Wire.h>
+#include <Adafruit_SHT31.h>
+#include "SparkFun_BMP581_Arduino_Library.h"
+
+#include <HardwareSerial.h>
+
+#define SDA_PIN 2  // Adjust if using different pins
+#define SCL_PIN 3  // Adjust if using different pins
+
+#define SERVICE_UUID        "30895e9c-a2c7-4cd5-ace8-4f04105557f8"
+#define CHARACTERISTIC_UUID "6c64540d-2e91-427b-89f9-4cfead744c62"
+
+#define SD_CS    10  // Chip Select
+#define SD_SCK   6   // Clock
+#define SD_MISO 18   // Master In Slave Out
+#define SD_MOSI 19   // Master Out Slave In
+#define RX_PIN 5
+#define TX_PIN 4
+#define SENSOR_BAUD 9600
+
+BLECharacteristic *pCharacteristic;
+bool deviceConnected = false;
+File dataFile;
+Adafruit_SHT31 sht31 = Adafruit_SHT31();
+BMP581 bmp;
+HardwareSerial mySerial(1);
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) {
+    deviceConnected = true;
+    Serial.println("BLE client connected");
+  }
+
+  void onDisconnect(BLEServer *pServer) {
+    deviceConnected = false;
+    Serial.println("BLE client disconnected");
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(100);
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  // Initialize UART1
+  mySerial.begin(SENSOR_BAUD, SERIAL_8N1, RX_PIN, TX_PIN); // 8 data bits, no parity, 1 stop bit
+
+  Serial.println("Initializing SHT31A...");
+  Serial.println("Initializing SD card...");
+  // Initialize SD card
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD card initialization failed!");
+    return;
+  }
+
+  Serial.println("SD card initialized.");
+
+  if (!sht31.begin(0x44)) {  // Use 0x44 for SHT31A
+    Serial.println("Couldn't find SHT31A sensor!");
+    while (1);
+  }
+  Serial.println("SHT31A sensor found!");
+
+  if (bmp.beginI2C(BMP581_I2C_ADDRESS_SECONDARY) != BMP5_OK) {
+    Serial.println("Couldn't find BMP581 sensor!");
+    while (1);
+  }
+  Serial.println("BMP581 sensor found!");
+
+  BLEDevice::init("ESP32_BLE_Server");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                     CHARACTERISTIC_UUID,
+                     BLECharacteristic::PROPERTY_READ |
+                     BLECharacteristic::PROPERTY_NOTIFY
+                   );
+
+  pCharacteristic->setValue("50");
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+
+  Serial.println("BLE server started, advertising...");
+}
+
+void loop() {
+  float temp = sht31.readTemperature();
+  float humidity = sht31.readHumidity();
+  float bmpPressure;        // Get pressure from BMP280
+  float bmpTemperature;
+  float oxygenValue = NAN;  // Initialize oxygen value as NaN (not a number)
+
+  String sensorData = "";  // String to store incoming data
+
+  if (mySerial.available()) {
+    // Read the data byte by byte from the sensor
+    while (mySerial.available()) {
+      char incomingByte = mySerial.read();
+      sensorData += incomingByte;  // Append each byte to the string
+    }
+
+    // Now we have the full string, look for the oxygen value
+    oxygenValue = extractOxygen(sensorData);
+  }
+
+  bmp5_sensor_data data = {0, 0};
+  if (bmp.getSensorData(&data) == BMP5_OK) {
+    bmpPressure = data.pressure;
+    bmpTemperature = data.temperature;
+  } else {
+    Serial.println("Failed to read BMP581 pressure data");
+  }
+
+  // Check if SHT31 readings are valid
+  if (!isnan(temp) && !isnan(humidity) && !isnan(oxygenValue)) {
+    char data[100];
+    snprintf(data, sizeof(data), "%.2f,%.2f,%.2f,%.2f", temp-6, humidity, bmpPressure / 100.0, (oxygenValue/10)+1);
+    Serial.println(data);
+
+    // Send data over BLE if connected
+    if (deviceConnected) {
+      pCharacteristic->setValue(data);
+      pCharacteristic->notify();
+      // Write to SD card
+      dataFile = SD.open("/log.txt", FILE_APPEND);
+      if (dataFile) {
+        dataFile.printf("SHT31: %.2f,%.2f, BMP280: %.2f, O2: %.2f\n", temp-6, humidity, bmpPressure / 100.0, (oxygenValue/10)+1);
+        dataFile.close();
+      } else {
+        Serial.println("Failed to open file for writing");
+      }
+    }
+  }
+  delay(2000); // Delay for 2 seconds before reading again
+}
+
+// Function to extract the oxygen value from the sensor data string
+float extractOxygen(String data) {
+  int startIdx = data.indexOf('O');  // Find the position of 'O'
+  if (startIdx != -1) {
+    startIdx += 2;  // Skip 'O' and the space after it
+    int endIdx = data.indexOf(' ', startIdx);  // Find the next space after the number
+
+    if (endIdx != -1) {
+      String oxygenValueStr = data.substring(startIdx, endIdx);  // Extract the oxygen value
+
+      // Convert the oxygen value string to a float
+      float oxygenValue = oxygenValueStr.toFloat();
+      
+      return oxygenValue;
+    }
+  }
+  return NAN;  // Return NaN if no oxygen value found or invalid format
+}
